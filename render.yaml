@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: brain-tumor-api
+    runtime: python
+    repo: https://github.com/yourusername/brain-tumor-api
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.0
