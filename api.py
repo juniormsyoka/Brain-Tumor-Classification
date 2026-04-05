@@ -1,6 +1,5 @@
-# api.py - Deploy this to Render
+# api.py - Fixed for Render deployment
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import torch
 import torch.nn as nn
@@ -18,13 +17,13 @@ app = FastAPI(title="Brain Tumor Classification API")
 # CORS for Next.js frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update with your frontend URL in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load model (global to avoid reloading)
+# Load model
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
@@ -32,17 +31,18 @@ class_to_idx = {'glioma_tumor': 0, 'meningioma_tumor': 1, 'pituitary_tumor': 2, 
 idx_to_class = {v: k for k, v in class_to_idx.items()}
 target_names = ['glioma_tumor', 'meningioma_tumor', 'pituitary_tumor', 'Normal']
 
-# Load your calibrated model
+# Load your model
 model = models.resnet50(weights=None)
 model.fc = nn.Linear(model.fc.in_features, 4)
-model.load_state_dict(torch.load('brain_tumor_model_finetuned.pth', map_location=device)['model_state_dict'])
+checkpoint = torch.load('brain_tumor_model_finetuned.pth', map_location=device)
+model.load_state_dict(checkpoint['model_state_dict'])
 model = model.to(device)
 model.eval()
 
 # Calibration temperature
 TEMPERATURE = 2.375
 
-# Class-specific temperatures (for better calibration)
+# Class-specific temperatures
 CLASS_TEMPERATURES = {
     'glioma_tumor': 2.2,
     'meningioma_tumor': 3.0,
@@ -57,7 +57,7 @@ transform = transforms.Compose([
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
-# Grad-CAM implementation
+# ============= FIXED: Grad-CAM without OpenCV =============
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model = model
@@ -65,7 +65,7 @@ class GradCAM:
         self.gradients = None
         self.activations = None
         target_layer.register_forward_hook(self.save_activation)
-        target_layer.register_backward_hook(self.save_gradient)
+        target_layer.register_full_backward_hook(self.save_gradient)
     
     def save_activation(self, module, input, output):
         self.activations = output.detach()
@@ -97,21 +97,36 @@ target_layer = model.layer4[-1]
 gradcam = GradCAM(model, target_layer)
 
 def create_heatmap_overlay(image_tensor, heatmap, alpha=0.5):
-    """Convert heatmap to base64 for frontend"""
+    """Convert heatmap to base64 - NO OpenCV/Matplotlib needed!"""
+    # Denormalize image
     img = image_tensor.squeeze().cpu().numpy().transpose(1, 2, 0)
     img = img * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
     img = np.clip(img, 0, 1)
     
-    import cv2
-    heatmap_resized = cv2.resize(heatmap, (img.shape[1], img.shape[0]))
-    heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
-    heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB) / 255.0
-    overlay = (1 - alpha) * img + alpha * heatmap_colored
+    # Resize heatmap using simple numpy interpolation
+    h, w = img.shape[:2]
+    heatmap_resized = np.array(Image.fromarray(heatmap).resize((w, h), Image.Resampling.BILINEAR))
     
-    # Convert to base64
-    import matplotlib.pyplot as plt
+    # Create colormap (jet colormap from scratch - no OpenCV!)
+    def jet_colormap(x):
+        """Jet colormap implementation"""
+        x = np.clip(x, 0, 1)
+        r = np.clip(1.5 - np.abs(4 * x - 2), 0, 1)
+        g = np.clip(1.5 - np.abs(4 * x - 1), 0, 1)
+        b = np.clip(1.5 - np.abs(4 * x), 0, 1)
+        return np.stack([r, g, b], axis=-1)
+    
+    heatmap_colored = jet_colormap(heatmap_resized)
+    
+    # Overlay
+    overlay = (1 - alpha) * img + alpha * heatmap_colored
+    overlay = np.clip(overlay, 0, 1)
+    
+    # Convert to base64 without matplotlib
+    from PIL import Image as PILImage
+    img_pil = PILImage.fromarray((overlay * 255).astype(np.uint8))
     buf = io.BytesIO()
-    plt.imsave(buf, overlay, format='png')
+    img_pil.save(buf, format='PNG')
     buf.seek(0)
     return base64.b64encode(buf.read()).decode('utf-8')
 
@@ -137,7 +152,6 @@ async def predict(
             logits = model(img_tensor)
             
             if use_class_temperature:
-                # Apply class-specific temperatures
                 scaled_logits = logits.clone()
                 for i, class_name in enumerate(target_names):
                     scaled_logits[0, i] = logits[0, i] / CLASS_TEMPERATURES[class_name]
@@ -168,12 +182,18 @@ async def predict(
         
         # Add Grad-CAM if requested
         if include_heatmap:
-            heatmap, _ = gradcam.generate(img_tensor, pred.item())
-            response["heatmap"] = create_heatmap_overlay(img_tensor, heatmap)
+            try:
+                heatmap, _ = gradcam.generate(img_tensor, pred.item())
+                response["heatmap"] = create_heatmap_overlay(img_tensor, heatmap)
+                print(f"Heatmap generated successfully for {predicted_class}")
+            except Exception as e:
+                print(f"Heatmap error: {e}")
+                response["heatmap_error"] = str(e)
         
         return response
     
     except Exception as e:
+        print(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
