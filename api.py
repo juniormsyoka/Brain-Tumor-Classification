@@ -65,33 +65,40 @@ class GradCAM:
         self.gradients = None
         self.activations = None
         target_layer.register_forward_hook(self.save_activation)
-        target_layer.register_backward_hook(self.save_gradient)
+        # ✅ Fix 1: Use register_full_backward_hook instead
+        target_layer.register_full_backward_hook(self.save_gradient)
     
     def save_activation(self, module, input, output):
-        self.activations = output.detach()
+        self.activations = output  # ✅ Fix 2: Don't .detach() here yet
     
     def save_gradient(self, module, grad_input, grad_output):
         self.gradients = grad_output[0].detach()
     
     def generate(self, input_image, target_class=None):
-        self.model.zero_grad()
-        output = self.model(input_image)
+        # ✅ Fix 3: Wrap in enable_grad() so backward() actually works
+        with torch.enable_grad():
+            input_image = input_image.requires_grad_(True)
+            self.model.zero_grad()
+            output = self.model(input_image)
+            
+            if target_class is None:
+                target_class = output.argmax(dim=1).item()
+            
+            one_hot = torch.zeros_like(output)
+            one_hot[0][target_class] = 1
+            output.backward(gradient=one_hot)
         
-        if target_class is None:
-            target_class = output.argmax(dim=1).item()
-        
-        one_hot = torch.zeros_like(output)
-        one_hot[0][target_class] = 1
-        output.backward(gradient=one_hot, retain_graph=True)
+        if self.gradients is None or self.activations is None:
+            raise ValueError("Gradients or activations not captured — hook failed.")
         
         weights = self.gradients.mean(dim=[2, 3], keepdim=True)
-        cam = (weights * self.activations).sum(dim=1, keepdim=True)
+        cam = (weights * self.activations.detach()).sum(dim=1, keepdim=True)
         cam = F.relu(cam)
         cam = cam - cam.min()
         cam = cam / (cam.max() + 1e-8)
         
         return cam.squeeze().cpu().numpy(), target_class
-
+    
 # Initialize Grad-CAM
 target_layer = model.layer4[-1]
 gradcam = GradCAM(model, target_layer)
@@ -132,12 +139,11 @@ async def predict(
         image = Image.open(io.BytesIO(contents)).convert('RGB')
         img_tensor = transform(image).unsqueeze(0).to(device)
         
-        # Predict with temperature scaling
+        # Predict with temperature scaling (no_grad for efficiency)
         with torch.no_grad():
             logits = model(img_tensor)
             
             if use_class_temperature:
-                # Apply class-specific temperatures
                 scaled_logits = logits.clone()
                 for i, class_name in enumerate(target_names):
                     scaled_logits[0, i] = logits[0, i] / CLASS_TEMPERATURES[class_name]
@@ -149,6 +155,7 @@ async def predict(
         
         predicted_class = idx_to_class[pred.item()]
         confidence_score = confidence.item()
+        pred_class_idx = pred.item()  # Save before any tensor ops
         
         # Prepare response
         response = {
@@ -167,14 +174,24 @@ async def predict(
         }
         
         # Add Grad-CAM if requested
+        # ✅ Uses a FRESH forward+backward pass with gradients OUTSIDE no_grad
         if include_heatmap:
-            heatmap, _ = gradcam.generate(img_tensor, pred.item())
-            response["heatmap"] = create_heatmap_overlay(img_tensor, heatmap)
+            # Create a fresh tensor detached from any previous no_grad context
+            heatmap_tensor = transform(image).unsqueeze(0).to(device)
+            
+            try:
+                heatmap, _ = gradcam.generate(heatmap_tensor, pred_class_idx)
+                response["heatmap"] = create_heatmap_overlay(heatmap_tensor, heatmap)
+            except ValueError as heatmap_err:
+                # Heatmap failed but prediction is still valid — return gracefully
+                response["heatmap"] = None
+                response["heatmap_error"] = str(heatmap_err)
         
         return response
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/health")
 async def health_check():
