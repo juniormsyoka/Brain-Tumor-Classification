@@ -15,10 +15,14 @@ import uvicorn
 
 app = FastAPI(title="Brain Tumor Classification API")
 
+origins = [
+    "https://braintumor-classification.vercel.app",
+    #"http://localhost:3000",  For local development
+]
 # CORS for Next.js frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update with your frontend URL in production
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
